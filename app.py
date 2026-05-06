@@ -128,7 +128,7 @@ def search_music(product, category, mood, df):
 只回覆JSON陣列，不要任何說明文字：
 [{{"seq": 序號, "reason": "20字內說明原因"}}, ...]"""
 
-    url  = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    url  = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
     body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
                        "generationConfig": {"maxOutputTokens": 512}}).encode()
     req  = urllib.request.Request(url, data=body,
