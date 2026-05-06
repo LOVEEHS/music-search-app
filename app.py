@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import io
 import urllib.request
+import urllib.error
 from datetime import datetime
 
 st.set_page_config(page_title="商品音樂搜尋", page_icon="🎵", layout="wide")
@@ -11,9 +12,9 @@ ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin123")
 USER_PASSWORD  = st.secrets.get("USER_PASSWORD",  "user123")
 GEMINI_KEY     = st.secrets.get("GEMINI_API_KEY", "")
 
-if "role"     not in st.session_state: st.session_state.role = None
-if "music_df" not in st.session_state: st.session_state.music_df = None
-if "results"  not in st.session_state: st.session_state.results = []
+if "role"       not in st.session_state: st.session_state.role = None
+if "music_df"   not in st.session_state: st.session_state.music_df = None
+if "results"    not in st.session_state: st.session_state.results = []
 if "last_query" not in st.session_state: st.session_state.last_query = {}
 
 # ══════════════════════════════════════
@@ -63,6 +64,31 @@ def show_admin_upload():
         st.dataframe(st.session_state.music_df, use_container_width=True, height=300)
 
 # ══════════════════════════════════════
+#  關鍵字預篩選（避免清單太大）
+# ══════════════════════════════════════
+def prefilter(df, product, category, mood):
+    keywords = (product + " " + mood).lower().split()
+    col_tags  = next((c for c in df.columns if "標籤" in c or "Mood" in c or "Tags" in c), "")
+    col_genre = next((c for c in df.columns if "風格" in c or "Genre" in c), "")
+
+    if not keywords or (not col_tags and not col_genre):
+        return df.head(200)  # 最多送200首
+
+    def score(row):
+        text = " ".join([
+            str(row.get(col_tags, "")),
+            str(row.get(col_genre, ""))
+        ]).lower()
+        return sum(1 for k in keywords if k in text)
+
+    df = df.copy()
+    df["_score"] = df.apply(score, axis=1)
+    top = df[df["_score"] > 0].sort_values("_score", ascending=False).head(150)
+    if len(top) < 30:
+        top = df.head(150)
+    return top.drop(columns=["_score"])
+
+# ══════════════════════════════════════
 #  Gemini AI 搜尋
 # ══════════════════════════════════════
 def search_music(product, category, mood, df):
@@ -70,10 +96,12 @@ def search_music(product, category, mood, df):
     col_genre = next((c for c in df.columns if "風格" in c or "Genre" in c), "")
     col_bpm   = next((c for c in df.columns if "節奏" in c or "BPM" in c), "")
     col_tags  = next((c for c in df.columns if "標籤" in c or "Mood" in c or "Tags" in c), "")
-    col_url   = next((c for c in df.columns if "連結" in c or "URL" in c or "url" in c), "")
+
+    # 預篩選，控制送出的資料量
+    filtered = prefilter(df, product, category, mood)
 
     lines = []
-    for _, row in df.iterrows():
+    for _, row in filtered.iterrows():
         seq   = row.get("序號", row.name + 1)
         name  = row.get(col_name, "")
         genre = row.get(col_genre, "") if col_genre else ""
@@ -82,28 +110,41 @@ def search_music(product, category, mood, df):
         lines.append(f"[{seq}] {name} | {genre} | {bpm} | {tags}")
 
     db_text = "\n".join(lines)
+
+    # 情境描述限制在200字內
+    mood_short = mood[:200] if mood else ""
+
     prompt = f"""你是專業的商業影片選曲顧問。
 
 使用者需求：
 - 商品名稱：{product or '未填寫'}
 - 商品類型：{category or '不限'}
-- 銷售氛圍／展演情境：{mood or '未填寫'}
+- 銷售氛圍：{mood_short or '未填寫'}
 
-音樂庫（共 {len(df)} 首）：
+音樂清單（共{len(filtered)}首）：
 {db_text}
 
-請用語意理解比對（模糊搜尋，不需完全符合關鍵字），挑選最合適的 5 首。
-只回覆 JSON 陣列，不要任何說明文字或markdown符號：
-[{{"seq": 序號, "reason": "30字內說明為何適合此商品與情境"}}, ...]"""
+請用語意理解比對，挑選最合適的5首。
+只回覆JSON陣列，不要任何說明文字：
+[{{"seq": 序號, "reason": "20字內說明原因"}}, ...]"""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
-    req  = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req) as r:
-        data = json.loads(r.read())
+    url  = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
+                       "generationConfig": {"maxOutputTokens": 512}}).encode()
+    req  = urllib.request.Request(url, data=body,
+                                  headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f"API 錯誤 {e.code}：{e.read().decode()}")
+
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     text = text.strip().replace("```json","").replace("```","").strip()
-    return json.loads(text)
+    # 只取第一個 JSON 陣列
+    start = text.find("[")
+    end   = text.rfind("]") + 1
+    return json.loads(text[start:end])
 
 # ══════════════════════════════════════
 #  下載 Excel
@@ -121,18 +162,17 @@ def results_to_excel(results, df):
         if matched.empty: continue
         row = matched.iloc[0]
         rows.append({
-            "排名": i+1,
-            "曲名": row.get(col_name, ""),
-            "風格": row.get(col_genre, "") if col_genre else "",
-            "節奏": row.get(col_bpm,   "") if col_bpm   else "",
-            "情境標籤": row.get(col_tags, "") if col_tags else "",
+            "排名":     i + 1,
+            "曲名":     row.get(col_name, ""),
+            "風格":     row.get(col_genre, "") if col_genre else "",
+            "節奏":     row.get(col_bpm,   "") if col_bpm   else "",
+            "情境標籤": row.get(col_tags,  "") if col_tags  else "",
             "推薦理由": r.get("reason", ""),
-            "試聽連結": row.get(col_url, "") if col_url else "",
+            "試聽連結": row.get(col_url,   "") if col_url   else "",
         })
-    out_df = pd.DataFrame(rows)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        out_df.to_excel(writer, index=False, sheet_name="推薦歌單")
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="推薦歌單")
     buf.seek(0)
     return buf
 
@@ -156,7 +196,8 @@ def show_search():
                 "食品／飲料","運動／健身","時尚／服飾","汽車／交通","旅遊／生活","其他"
             ])
         mood = st.text_area("銷售氛圍 / 展演情境",
-            placeholder="隨意描述你想要的感覺，例如：溫馨居家感、高級精品風、輕快活力…", height=100)
+            placeholder="描述你想要的感覺，例如：溫馨居家感、高級精品風、輕快活力…（200字內）",
+            height=100, max_chars=200)
         submitted = st.form_submit_button("🔍 搜尋合適音樂", use_container_width=True)
 
     if submitted:
@@ -165,11 +206,11 @@ def show_search():
         elif not GEMINI_KEY:
             st.error("API 金鑰未設定，請聯絡管理員")
         else:
-            with st.spinner("AI 正在從音樂庫比對最適合的曲目..."):
+            with st.spinner("AI 正在比對最適合的曲目..."):
                 try:
                     picks = search_music(product, category, mood, st.session_state.music_df)
                     st.session_state.results = picks
-                    st.session_state.last_query = {"product":product,"category":category,"mood":mood}
+                    st.session_state.last_query = {"product": product, "category": category, "mood": mood}
                 except Exception as e:
                     st.error(f"搜尋發生錯誤：{e}")
 
@@ -187,20 +228,20 @@ def show_search():
         st.markdown(f"### 為你推薦 {len(st.session_state.results)} 首最合適的音樂")
 
         for i, r in enumerate(st.session_state.results):
-            seq = r.get("seq")
+            seq     = r.get("seq")
             matched = df[df["序號"] == seq] if "序號" in df.columns else pd.DataFrame()
             if matched.empty: continue
-            row = matched.iloc[0]
+            row    = matched.iloc[0]
             name   = str(row.get(col_name,"")).replace("EHS-SUNO,","").replace(".mp3","")
             genre  = row.get(col_genre,"") if col_genre else ""
             bpm    = row.get(col_bpm,  "") if col_bpm   else ""
             tags   = row.get(col_tags, "") if col_tags  else ""
             url    = row.get(col_url,  "") if col_url   else ""
             reason = r.get("reason","")
-            label  = "🥇 最推薦" if i==0 else f"#{i+1}"
+            label  = "🥇 最推薦" if i == 0 else f"#{i+1}"
 
             with st.container(border=True):
-                c1, c2 = st.columns([5,1])
+                c1, c2 = st.columns([5, 1])
                 with c1:
                     st.markdown(f"**{label}　{name}**")
                     tag_str = "　".join(
@@ -212,14 +253,14 @@ def show_search():
                     st.caption(f"推薦理由：{reason}")
                 with c2:
                     if url:
-                        st.link_button("試聽", url, use_container_width=True)
+                        st.link_button("試聽", str(url), use_container_width=True)
 
         st.markdown("---")
         excel_buf = results_to_excel(st.session_state.results, df)
-        filename  = f"推薦歌單_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button(
             label="⬇️ 下載推薦歌單（Excel）",
-            data=excel_buf, file_name=filename,
+            data=excel_buf,
+            file_name=f"推薦歌單_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
@@ -231,8 +272,7 @@ if st.session_state.role is None:
     show_login()
 else:
     with st.sidebar:
-        role_label = "管理員" if st.session_state.role == "admin" else "一般使用者"
-        st.markdown(f"**身份：{role_label}**")
+        st.markdown(f"**身份：{'管理員' if st.session_state.role == 'admin' else '一般使用者'}**")
         if st.session_state.music_df is not None:
             st.caption(f"音樂庫：{len(st.session_state.music_df)} 首")
         if st.button("登出"):
@@ -241,7 +281,7 @@ else:
             st.rerun()
         if st.session_state.role == "admin":
             st.markdown("---")
-            page = st.radio("功能", ["搜尋音樂","管理清單"])
+            page = st.radio("功能", ["搜尋音樂", "管理清單"])
         else:
             page = "搜尋音樂"
 
